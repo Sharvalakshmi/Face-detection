@@ -1,0 +1,168 @@
+import os
+import cv2
+import numpy as np
+import pickle
+import tensorflow as tf
+from tensorflow.keras.applications import VGG16
+from tensorflow.keras.models import Model, Sequential
+from tensorflow.keras.layers import Dropout
+from tensorflow.keras.layers import Dense, Flatten
+from tensorflow.keras.optimizers import Adam
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelEncoder
+from tkinter import simpledialog, messagebox
+import tkinter as tk
+
+IMG_SIZE = 100  # Image size for CNN
+BATCH_SIZE = 32
+EPOCHS = 10  # Increase for better training
+
+# Load and preprocess dataset
+def load_data(data_path="dataset"):
+    labels, faces_data = [], []
+    face_detector = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+    
+    for person_name in os.listdir(data_path):
+        person_folder = os.path.join(data_path, person_name)
+        if not os.path.isdir(person_folder):
+            continue
+        for image_name in os.listdir(person_folder):
+            image_path = os.path.join(person_folder, image_name)
+            image = cv2.imread(image_path)
+            if image is None:
+                continue
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)  # Convert to RGB
+            faces = face_detector.detectMultiScale(image, 1.1, 5, minSize=(50, 50))
+            if len(faces) == 0:
+                continue
+            x, y, w, h = faces[0]
+            face_resized = cv2.resize(image[y:y+h, x:x+w], (IMG_SIZE, IMG_SIZE))
+            faces_data.append(face_resized)
+            labels.append(person_name)
+
+    return np.array(faces_data), np.array(labels)
+
+# Build the CNN model using VGG16
+def build_model(num_classes):
+    base_model = VGG16(weights="imagenet", include_top=False, input_shape=(IMG_SIZE, IMG_SIZE, 3))
+    for layer in base_model.layers[:-4]:
+        layer.trainable = False  # Freeze VGG16 layers
+
+    model = Sequential([
+        base_model,
+        Flatten(),
+        Dense(128, activation="relu"),
+        Dropout(0.8),  # Dropout layer to prevent overfitting
+        Dense(num_classes, activation="softmax")  # Output layer
+    ])
+    
+    model.compile(optimizer=Adam(learning_rate=0.001), loss="sparse_categorical_crossentropy", metrics=["accuracy"])
+    return model
+
+# Train and save the CNN model
+def train_model():
+    faces_data, labels = load_data()
+    if len(set(labels)) < 2:
+        messagebox.showerror("Error", "At least two different people are required for training.")
+        return
+
+    le = LabelEncoder()
+    labels = le.fit_transform(labels)
+
+    # Normalize images
+    faces_data = faces_data / 255.0
+
+    X_train, X_test, y_train, y_test = train_test_split(faces_data, labels, test_size=0.2, random_state=42)
+
+    model = build_model(num_classes=len(set(labels)))
+    model.fit(X_train, y_train, validation_data=(X_test, y_test), epochs=EPOCHS, batch_size=BATCH_SIZE)
+
+    model.save("face_recognition_cnn.h5")
+    pickle.dump(le, open("label_encoder.pkl", "wb"))
+
+    messagebox.showinfo("Success", "CNN Model trained successfully!")
+
+# Real-time face recognition using CNN
+def recognize():
+    model = tf.keras.models.load_model("face_recognition_cnn.h5")
+    le = pickle.load(open("label_encoder.pkl", "rb"))
+    cap = cv2.VideoCapture(0)
+    face_detector = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        faces = face_detector.detectMultiScale(gray, 1.2, 6, minSize=(50, 50))
+
+        for (x, y, w, h) in faces:
+            face_resized = cv2.resize(frame[y:y+h, x:x+w], (IMG_SIZE, IMG_SIZE))
+            face_resized = np.expand_dims(face_resized / 255.0, axis=0)
+
+            predictions = model.predict(face_resized)
+            best_class_index = np.argmax(predictions)
+            confidence = predictions[0][best_class_index]
+            predicted_name = le.inverse_transform([best_class_index])[0] if confidence > 0.6 else "Unknown"
+
+            cv2.rectangle(frame, (x, y), (x + w, y + h), (255, 0, 0), 2)
+            cv2.putText(frame, f"{predicted_name} ({confidence*100:.1f}%)", (x, y - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+
+        cv2.imshow("Face Recognition", frame)
+        if cv2.waitKey(1) & 0xFF == ord("q"):
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+# Add a new face dataset
+
+def add_new_face():
+    name = simpledialog.askstring("Input", "Enter new person's name:")
+    if not name:
+        return
+    save_folder = os.path.join("dataset", name)
+    os.makedirs(save_folder, exist_ok=True)
+    cap = cv2.VideoCapture(0)
+    face_detector = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+    count = 0
+    
+    while count < 100:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        faces = face_detector.detectMultiScale(gray, 1.1, 5, minSize=(50, 50))
+        for (x, y, w, h) in faces:
+            face_resized = cv2.resize(frame[y:y+h, x:x+w], (IMG_SIZE, IMG_SIZE))  # Keep it colored (RGB)
+            cv2.imwrite(os.path.join(save_folder, f"{count}.jpg"), face_resized)
+            count += 1
+        cv2.imshow("Capturing Face", frame)
+        if cv2.waitKey(1) & 0xFF == ord("q"):
+            break
+    cap.release()
+    cv2.destroyAllWindows()
+
+    # Notify user to retrain the model
+    retrain = messagebox.askyesno("Training Required", "New face added! Do you want to retrain the model now?")
+    if retrain:
+        train_model()
+    else:
+        messagebox.showinfo("Reminder", "Retrain the model manually before recognition.")
+
+  
+
+# GUI for the application
+def main():
+    root = tk.Tk()
+    root.title("Face Recognition System")
+    tk.Label(root, text="Face Recognition System", font=("Arial", 16)).pack(pady=10)
+    tk.Button(root, text="Train Model", command=train_model, width=20).pack(pady=5)
+    tk.Button(root, text="Recognize Faces", command=recognize, width=20).pack(pady=5)
+    tk.Button(root, text="Add New Person", command=add_new_face, width=20).pack(pady=5)
+    tk.Button(root, text="Exit", command=root.quit, width=20).pack(pady=5)
+    root.mainloop()
+
+if __name__ == "__main__":
+    main()
